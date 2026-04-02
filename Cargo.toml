@@ -1,0 +1,25 @@
+[package]
+name = "ebpf-jit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+aya = { git = "https://github.com/aya-rs/aya", default-features = false }
+clap = { version = "4.5.20", default-features = false, features = ["std", "derive"] }
+inkwell = { version = "0.8.0", features = ["llvm18-1"] }
+libc = { version = "0.2.159", default-features = false }
+tokio = { version = "1.40.0", default-features = false, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+] }
+
+[[bin]]
+name = "ebpf-jit"
+path = "src/main.rs"
+
+[profile.release]
+debug = 2
+codegen-units = 1
