@@ -24,7 +24,10 @@ const ETH_TYPE_IPV4_LE: u64 = 0x0008; // 0x0800 in network byte order, as LE u16
 const IPV4_SRC_OFFSET: u64 = ETH_HEADER_LEN + 12; // 26
 const IPV4_MIN_PACKET_LEN: u64 = ETH_HEADER_LEN + 20; // 34
 
-pub fn compile_filter(allowed_ips: &[Ipv4Addr]) -> Result<Vec<u8>> {
+pub fn compile_filter(
+    allow_subnets_fast_path: &[(Ipv4Addr, u8)],
+    allowed_ips: &[Ipv4Addr],
+) -> Result<Vec<u8>> {
     let context = LlvmContext::create();
     let module = context.create_module("vm_filter");
     let builder = context.create_builder();
@@ -43,6 +46,8 @@ pub fn compile_filter(allowed_ips: &[Ipv4Addr]) -> Result<Vec<u8>> {
     let bounds_check = context.append_basic_block(function, "bounds_check");
     let check_eth = context.append_basic_block(function, "check_eth");
     let check_ip = context.append_basic_block(function, "check_ip");
+    let check_allow_subnets_fast_path =
+        context.append_basic_block(function, "check_allow_subnets_fast_path");
     let allow_block = context.append_basic_block(function, "allow");
     let deny_block = context.append_basic_block(function, "deny");
 
@@ -160,6 +165,61 @@ pub fn compile_filter(allowed_ips: &[Ipv4Addr]) -> Result<Vec<u8>> {
         .unwrap()
         .into_int_value();
 
+    // Fast path: subnet checks via mask + compare
+    // For each IP, count trailing zero bits (big-endian) to derive the prefix,
+    // then emit: (src_ip & mask) == subnet → allow
+    let check_exact = context.append_basic_block(function, "check_exact");
+    let mut current_block = check_allow_subnets_fast_path;
+    builder.build_unconditional_branch(check_allow_subnets_fast_path).unwrap();
+
+    for (i, (ip, prefix_len)) in allow_subnets_fast_path.iter().enumerate() {
+        builder.position_at_end(current_block);
+
+        let host_bits = 32 - *prefix_len as u32;
+        let mask_be = if host_bits >= 32 {
+            0u32
+        } else {
+            !((1u32 << host_bits) - 1)
+        };
+        let mask_raw = u32::from_ne_bytes(mask_be.to_be_bytes());
+        let subnet_raw = u32::from_ne_bytes(ip.octets()) & mask_raw;
+
+        let masked = builder
+            .build_and(
+                src_ip,
+                i32_type.const_int(mask_raw as u64, false),
+                &format!("masked_{i}"),
+            )
+            .unwrap();
+        let matches = builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                masked,
+                i32_type.const_int(subnet_raw as u64, false),
+                &format!("subnet_match_{i}"),
+            )
+            .unwrap();
+
+        let next_block = if i + 1 < allow_subnets_fast_path.len() {
+            context.append_basic_block(function, &format!("fast_path_{}", i + 1))
+        } else {
+            check_exact
+        };
+
+        builder
+            .build_conditional_branch(matches, allow_block, next_block)
+            .unwrap();
+        current_block = next_block;
+    }
+
+    // If no fast path IPs, just fall through
+    if allow_subnets_fast_path.is_empty() {
+        builder.position_at_end(check_allow_subnets_fast_path);
+        builder.build_unconditional_branch(check_exact).unwrap();
+    }
+
+    // Exact match via switch
+    builder.position_at_end(check_exact);
     let cases: Vec<_> = allowed_ips
         .iter()
         .map(|ip| {

@@ -18,10 +18,13 @@ async fn main() -> anyhow::Result<()> {
 
     use std::net::Ipv4Addr;
 
+    let allow_subnets_fast_path = vec![
+        (Ipv4Addr::new(10, 60, 0, 0), 16u8), // allow 10.60.0.0/16
+    ];
     let allowed_ips = vec![Ipv4Addr::new(10, 69, 42, 2)];
 
     let start_time = std::time::Instant::now();
-    let elf_bytes = compiler::compile_filter(&allowed_ips)?;
+    let elf_bytes = compiler::compile_filter(&allow_subnets_fast_path, &allowed_ips)?;
     let duration = start_time.elapsed();
 
     fs::write("target/filter.o", &elf_bytes)?;
@@ -32,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
         duration
     );
 
+    println!("allowed subnets fast path: {:?}", allow_subnets_fast_path);
     println!("allowed IPs: {:?}", allowed_ips);
 
     // Disassemble to see what LLVM generated
